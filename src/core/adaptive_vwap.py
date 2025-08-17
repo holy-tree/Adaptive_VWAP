@@ -176,18 +176,66 @@ if __name__ == "__main__":
                                         device,
                                         vae_model
                                     )
+
+                                    # STEP 2： 计算回报与回撤
+                                    # 2.1 回报
+                                    # 从 metrics 字典中提取关键价格
+                                    adaptive_vwap_price = metrics.get("Adaptive VWAP Price", 0)
+                                    naive_vwap_price = metrics.get("naive VWAP", 0)
+
+                                    # 计算每单位的回报（与基准 VWAP 相比）
+                                    if trade_direction.lower() == "buy":
+                                        # 买入策略：价格越低越好，所以用基准价减去实际成交价
+                                        return_per_unit = naive_vwap_price - adaptive_vwap_price
+                                    else:  # "sell"
+                                        # 卖出策略：价格越高越好，所以用实际成交价减去基准价
+                                        return_per_unit = adaptive_vwap_price - naive_vwap_price
+
+                                    # 计算总回报
+                                    total_return = return_per_unit * total_quantity
+
+                                    print(f"该笔交易每单位回报为: {return_per_unit:.4f}")
+                                    print(f"该笔交易的总回报为: {total_return:.2f}")
+                                    metrics["Total Return"] = total_return
+
+                                    # 2.2 回撤
+                                    # 检查 results_df 是否为空，以避免错误
+                                    if results_df.empty:
+                                        print("警告: 回测结果数据为空，无法计算回撤。")
+                                        mae = 0.0
+                                    else:
+                                        # 获取第一笔成交价作为进场基准价
+                                        entry_price = results_df.iloc[0]['execution_price']
+                                        trade_direction = metrics.get('trade_direction', 'buy')
+
+                                        # 计算最大不利偏离 (MAE)
+                                        if trade_direction.lower() == "buy":
+                                            # 多头回撤：价格下跌
+                                            min_price_during_trade = results_df['execution_price'].min()
+                                            mae = (entry_price - min_price_during_trade) / entry_price
+                                        else:  # "sell"
+                                            # 空头回撤：价格上涨
+                                            max_price_during_trade = results_df['execution_price'].max()
+                                            mae = (max_price_during_trade - entry_price) / entry_price
+
+                                    print(f"该笔交易的最大回撤（MAE）为: {mae:.2%}")
+                                    metrics["Max Adverse Excursion (MAE)"] = mae
+
                                     # --- 保存结果 ---
                                     os.makedirs(f"../../results/{trade_direction}_results", exist_ok=True)
                                     base_filename = os.path.basename(data_file).replace('.csv', '')
                                     param_str = f"{length_param}_{std_param}_{stl_param}_{n_param}_win{execution_window}"
                                     results_df_name = f"aanew_boll_results_df_{trade_direction}_{execution_window}MINexecution_window_{model_name}_{symbol}_{time_interval}_{base_filename}_{param_str}.csv"
                                     metrics_name = f"aanew_boll_metrics_{trade_direction}_{execution_window}MINexecution_window_{model_name}_{symbol}_{time_interval}_{base_filename}_{param_str}.csv"
-                                    results_df.to_csv(os.path.join(f"../../results/{trade_direction}_results", results_df_name))
+                                    results_df.to_csv(
+                                        os.path.join(f"../../results/{trade_direction}_results", results_df_name))
                                     pd.DataFrame([metrics]).to_csv(
                                         os.path.join(f"../../results/{trade_direction}_results", metrics_name),
                                         index=False)
                                     print(
                                         f"[{selected_interval_label}] 回测完成，结果已保存为 {results_df_name} 和 {metrics_name}")
+
+
 
 
 

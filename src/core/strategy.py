@@ -24,7 +24,7 @@ def save_directional_signals(df, symbol, time_interval, execution_window, signal
     # 基于阈值和信号类型筛选数据
     filtered_signals_df = df[
         (df['signal'].isin(['Buy', 'Sell']))
-        & (df['signal_strength'] > signal_threshold)
+        # & (df['signal_strength'] > signal_threshold)
     ].copy()
 
     # 格式化输出 DataFrame
@@ -175,9 +175,9 @@ def run_adaptive_backtest(
             'actual_volume': current_minute_raw_data['volume'],
             'predicted_price': predicted_close_for_this_minute,
             'execution_price': execution_price,
-            # 'order_quantity': final_order_quantity,
-            # 'trade_value': final_order_quantity * execution_price,
-            # 'remaining_quantity': remaining_quantity
+            'order_quantity': final_order_quantity,
+            'trade_value': final_order_quantity * execution_price,
+            'remaining_quantity': remaining_quantity
         })
 
     # --- 后处理与指标计算 ---
