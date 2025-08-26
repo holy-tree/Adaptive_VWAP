@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 import argparse
 
-from generate_signal import generate_bollinger_signals
+from generate_signal import generate_bollinger_signals, generate_gan_signals, load_trained_gan_generators
 from src.core.strategy import save_directional_signals, run_adaptive_backtest
 from src.utils.data_utils import resample_data, set_seed, load_financial_data, get_signal_index
 from src.utils.model_utils import load_predictor_model, load_vae_model
@@ -29,14 +29,16 @@ time_interval_map = {
     '30分钟': '30min', '1小时': '60min', '日线': 'D'
 }
 
+window_sizes = [15,25,35]
+
 logging.basicConfig(level=logging.DEBUG)  # 默认 INFO，不会显示 DEBUG
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     for model_name in ["our-transformer", "rnn", "lstm"]:
-        # for symbol in ["rb9999", "i9999", "cu9999", "ni9999", "sc9999", "pg9999", "y9999", "ag9999", "m9999",
-        #                "c9999", "TA9999", "UR9999", "OI9999", "au9999", "IH9999", "T9999", "CF9999", "AP9999"]:
-        for symbol in ["sc9999"]:
+        for symbol in ["rb9999", "i9999", "cu9999", "ni9999", "sc9999", "pg9999", "y9999", "ag9999", "m9999",
+                       "c9999", "TA9999", "UR9999", "OI9999", "au9999", "IH9999", "T9999", "CF9999", "AP9999"]:
+        # for symbol in ["ag9999"]:
             set_seed(42)
             # 参数设置
             parser = argparse.ArgumentParser(description="VWAP批量回测参数")
@@ -57,6 +59,8 @@ if __name__ == "__main__":
             # 检测交易信号的频率buy sell hold
             parser.add_argument('--intervals', type=str, default='1min,5min,15min,30min,60min,D',
                                 help='逗号分隔的周期列表，如1min,5min,15min,30min,60min,D')
+            # parser.add_argument('--intervals', type=str, default='5min,15min',
+            #                     help='逗号分隔的周期列表，如1min,5min,15min,30min,60min,D')
             parser.add_argument('--start_date', type=str, required=False, default="2025-06-05",
                                 help='回测开始日期，格式: YYYY-MM-DD')
             parser.add_argument('--end_date', type=str, required=False, default="2025-06-06",
@@ -100,6 +104,7 @@ if __name__ == "__main__":
             # 加载模型
             predictor_model = load_predictor_model(model_name, predictor_model_path, device=device)
             vae_model = load_vae_model(vae_model_path, ohlcv_dim, latent_dim, 64, 5.0, device)
+            gan_generators = load_trained_gan_generators(data_file.split('/')[-1].split('.csv')[0], device,window_sizes)
 
             # 加载1分钟数据集
             dataset_1min = load_financial_data(data_file, model_input_seq_length, latent_dim)
@@ -120,21 +125,41 @@ if __name__ == "__main__":
                     bollinger_params = {"length": length_param, "std": std_param, "stl_param": stl_param,
                                         "n_param": n_param}
                     # 使用 resampled_df 作为输入，并确保它有时间索引
-                    signals_df = resampled_df.copy()
-                    bollinger_signal_df = generate_bollinger_signals(signals_df, **bollinger_params)
+                    # signals_df = resampled_df.copy()
+                    # generated_signals = generate_bollinger_signals(signals_df, **bollinger_params)
+                    generated_signals =generate_gan_signals(
+                            data_file, gan_generators, device, window_sizes,
+                            prediction_horizon=execution_window
+                        )
 
-                    logger.debug(f"生成的Bollinger信号数: {len(bollinger_signal_df)}")
-                    logger.debug(f"信号示例:\n{bollinger_signal_df.head()}")
+                    logger.debug(f"信号示例:\n{generated_signals.head()}")
+                    # 【新增步骤】3. 根据重采样后的时间点筛选信号
+                    # 获取重采样数据的日期列表
+                    resampled_dates = resampled_df['date'].tolist()
+
+                    # 筛选出与重采样时间点匹配的信号
+                    # 使用 pd.merge 是一个简洁且高效的方法
+                    gan_signals_df = pd.merge(
+                        generated_signals,
+                        pd.DataFrame({'date': resampled_dates}),
+                        on='date',
+                        how='inner'
+                    )
+
+                    print(f"[{selected_interval_label}] 筛选后信号数量: {len(gan_signals_df)}")
+
+                    # 将筛选后的信号数据作为后续逻辑的输入
+                    generated_signals = gan_signals_df.copy()
 
                     allowed_windows = interval_to_windows.get(time_interval, [1])
                     # 基于阈值和信号类型筛选数据
                     for execution_window in allowed_windows:
                         save_directional_signals(
-                            df=bollinger_signal_df,
+                            df=generated_signals,
                             symbol=symbol,
                             time_interval=time_interval,
                             execution_window=execution_window,
-                            signal_type="bollinger",
+                            signal_type="gan",
                             signal_threshold=0.0
                         )
 
@@ -145,27 +170,27 @@ if __name__ == "__main__":
                     if args.start_date:
                         start_dt = pd.to_datetime(args.start_date)
                         # 获取DataFrame的日期时区信息
-                        tz = bollinger_signal_df['date'].dt.tz
+                        tz = generated_signals['date'].dt.tz
                         # 将筛选日期转换为相同的时区
                         start_dt_tz = start_dt.tz_localize(tz)
-                        bollinger_signal_df = bollinger_signal_df[bollinger_signal_df['date'] >= start_dt_tz]
+                        generated_signals = generated_signals[generated_signals['date'] >= start_dt_tz]
                     if args.end_date:
                         end_dt = pd.to_datetime(args.end_date)
-                        tz = bollinger_signal_df['date'].dt.tz
+                        tz = generated_signals['date'].dt.tz
                         end_dt_tz = end_dt.tz_localize(tz)
-                        bollinger_signal_df = bollinger_signal_df[bollinger_signal_df['date'] <= end_dt_tz]
+                        generated_signals = generated_signals[generated_signals['date'] <= end_dt_tz]
 
                     # 2. 开始遍历交易信号
                     for trade_direction in ["buy", "sell"]:
-                        filtered_trade_signal = bollinger_signal_df[
-                            bollinger_signal_df['signal'].str.lower() == trade_direction
+                        filtered_trade_signal = generated_signals[
+                            generated_signals['signal'].str.lower() == trade_direction
                             ].copy()
 
                         # 3. 执行所有窗口的回测
                         for execution_window in allowed_windows:
                             all_metrics_list = []
                             all_results_df_list = []
-                            for _, trade_signal in bollinger_signal_df.iterrows():
+                            for _, trade_signal in generated_signals.iterrows():
                                 signal_time = trade_signal['date']
 
                                 # 4. 获取信号在1分钟数据中的索引
@@ -227,7 +252,7 @@ if __name__ == "__main__":
                                 print(f"该笔交易的总回报为: {total_return:.2f}")
                                 metrics["Total Return"] = total_return
 
-                                # 2.2 回撤
+                                # 2.2 回撤(越小越好)
                                 # 检查 results_df 是否为空，以避免错误
                                 if results_df.empty:
                                     logger.error("警告: 回测结果数据为空，无法计算回撤。")
@@ -273,9 +298,6 @@ if __name__ == "__main__":
                                 combined_metrics_df.to_csv(os.path.join(output_dir, "metrics.csv"), index=False)
 
                                 print(f"[{selected_interval_label}] 所有回测完成，结果已保存至: {output_dir}")
-
-
-
 
                 except Exception as e:
                     logger.error(f"[{selected_interval_label}] 发生错误: {e}")
