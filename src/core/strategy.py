@@ -65,6 +65,7 @@ def run_adaptive_backtest(
     }
     # 默认为5分钟，如果selected_interval_label不在映射中
     closeout_window = closeout_window_map.get(execution_window, 15)
+    start_timestamp = raw_df_1min.iloc[signal_idx_1min]['date']
 
     for t in range(execution_window):
         order_quantity_for_this_minute = 0.0
@@ -191,12 +192,15 @@ def run_adaptive_backtest(
     model_total_trade_value = results_df['trade_value'].sum()
     model_total_quantity_traded = results_df['order_quantity'].sum()
     model_achieved_price = model_total_trade_value / model_total_quantity_traded if model_total_quantity_traded > 0 else 0
+
+    # 计算滑点
     if trade_direction.lower() == 'buy':
         slippage_per_share = benchmark_vwap - model_achieved_price
     else:
         slippage_per_share = model_achieved_price - benchmark_vwap
     total_cost_savings = slippage_per_share * total_quantity
     slippage_bps = (slippage_per_share / benchmark_vwap) * 10000 if benchmark_vwap > 0 else 0
+
     results_df['cumulative_benchmark_value'] = (results_df['execution_price'] * results_df['actual_volume']).cumsum()
     results_df['cumulative_actual_volume'] = results_df['actual_volume'].cumsum()
     results_df['traditional_vwap_line'] = results_df['cumulative_benchmark_value'] / results_df[
@@ -206,6 +210,12 @@ def run_adaptive_backtest(
     results_df['model_vwap_line'] = (
             results_df['cumulative_model_value'] / results_df['cumulative_model_volume']).replace([np.inf, -np.inf],
                                                                                                   np.nan).ffill()
-    metrics = {"naive VWAP": benchmark_vwap, "Adaptive VWAP Price": model_achieved_price,
-               "Slippage Reduction (BPS)": slippage_bps, "Total Cost Savings": total_cost_savings}
+    metrics = {
+        "start_time": start_timestamp,  # 新增：回测开始时间
+        "execution_window": execution_window,  # 新增：执行窗口长度
+        "naive VWAP": benchmark_vwap,
+        "Adaptive VWAP Price": model_achieved_price,
+        "Slippage Reduction (BPS)": slippage_bps,
+        "Total Cost Savings": total_cost_savings
+    }
     return results_df.set_index('timestamp'), metrics
