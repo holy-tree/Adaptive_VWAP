@@ -5,7 +5,7 @@ import numpy as np
 import pandas_ta as ta
 import pandas as pd
 import torch
-import joblib
+import torch.nn.functional as F
 
 from src.utils.model_utils import process_inference_data
 
@@ -152,8 +152,156 @@ def generate_bollinger_signals(df, length=20, std=2.0, stl_param=5.0, n_param=6.
     return df
 
 
+def generate_macd_signals_dual(df, fast=12, slow=26, signal_period=9, stl_param=5.0, n_param=6.0):
+    """
+    基于MACD的双向策略生成交易信号：
+    - 二次金叉或底背离买入
+    - 顶背离卖出
+    - 加入止损逻辑（ATR + 百分比）
+
+    Returns:
+        DataFrame 带 'signal' 列
+    """
+    if df.empty:
+        df['signal'] = []
+        return df
+
+    # 计算指标
+    macd = ta.macd(df['close'], fast=fast, slow=slow, signal=signal_period)
+    df['MACD'] = macd[f"MACD_{fast}_{slow}_{signal_period}"]
+    df['MACD_signal'] = macd[f"MACDs_{fast}_{slow}_{signal_period}"]
+    df['MACD_hist'] = macd[f"MACDh_{fast}_{slow}_{signal_period}"]
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=fast)
+
+    signals = ['Hold'] * len(df)
+    position = 0  # 1=多仓，-1=空仓，0=空仓
+    bkhigh = 0.0
+    sklow = float('inf')
+    last_buy_index = -5  # 控制二次金叉间隔
+
+    for i in range(2, len(df)):
+        row = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        # 止损逻辑
+        if position == 1:
+            stop_loss_atr = bkhigh - n_param * row['atr']
+            stop_loss_stl = prev_row['close'] * (1 - 0.01 * stl_param)
+            if row['close'] <= stop_loss_atr or prev_row['low'] < stop_loss_stl:
+                signals[i] = 'Close_Buy'
+                position = 0
+                continue
+            bkhigh = max(bkhigh, row['high'])
+
+        elif position == -1:
+            stop_loss_atr = sklow + n_param * row['atr']
+            stop_loss_stl = prev_row['close'] * (1 + 0.01 * stl_param)
+            if row['close'] >= stop_loss_atr or prev_row['high'] > stop_loss_stl:
+                signals[i] = 'Close_Sell'
+                position = 0
+                continue
+            sklow = min(sklow, row['low'])
+
+        # 入场逻辑
+        if position == 0:
+            # 二次金叉
+            if df['MACD'].iloc[i] > df['MACD_signal'].iloc[i] and df['MACD'].iloc[i - 1] <= df['MACD_signal'].iloc[
+                i - 1]:
+                if i - last_buy_index >= 3:
+                    signals[i] = 'Buy'
+                    position = 1
+                    bkhigh = row['high']
+                    last_buy_index = i
+
+            # 底背离买入
+            elif df['MACD_hist'].iloc[i] > df['MACD_hist'].iloc[i - 1] and df['close'].iloc[i] < df['close'].iloc[
+                i - 1]:
+                signals[i] = 'Buy'
+                position = 1
+                bkhigh = row['high']
+                last_buy_index = i
+
+            # 顶背离卖出开空
+            elif df['MACD_hist'].iloc[i] < df['MACD_hist'].iloc[i - 1] and df['close'].iloc[i] > df['close'].iloc[
+                i - 1]:
+                signals[i] = 'Sell'
+                position = -1
+                sklow = row['low']
+
+    df['signal'] = signals
+    return df
+
+
+
+def generate_kdj_signals(df, length=9, signal_smooth=3, stl_param=5.0, n_param=6.0):
+    """
+    基于KDJ指标生成多头和空头交易信号，包含止损平仓。
+
+    Args:
+        df (pd.DataFrame): 包含'high', 'low', 'close'的DataFrame
+        length (int): RSV的周期（一般9）
+        signal_smooth (int): K与D的平滑周期（一般3）
+        stl_param (float): 百分比止损
+        n_param (float): ATR止损倍数
+
+    Returns:
+        pd.DataFrame: 添加'signal'列
+    """
+    if df.empty:
+        df['signal'] = []
+        return df
+
+    # 计算KDJ
+    kdj = ta.stoch(df['high'], df['low'], df['close'], k=length, d=signal_smooth, smooth_k=signal_smooth)
+    df['K'] = kdj['STOCHk_9_3_3']
+    df['D'] = kdj['STOCHd_9_3_3']
+    df['J'] = 3 * df['K'] - 2 * df['D']
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=length)
+
+    signals = ['Hold'] * len(df)
+    position = 0  # 1=多头，-1=空头，0=空仓
+    bkhigh = 0.0
+    sklow = float('inf')
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        # --- 止损 ---
+        if position == 1:
+            stop_loss_atr = bkhigh - n_param * row['atr']
+            stop_loss_stl = prev_row['close'] * (1 - 0.01 * stl_param)
+            if row['close'] <= stop_loss_atr or row['low'] < stop_loss_stl:
+                signals[i] = 'Close_Buy'
+                position = 0
+                continue
+            bkhigh = max(bkhigh, row['high'])
+
+        elif position == -1:
+            stop_loss_atr = sklow + n_param * row['atr']
+            stop_loss_stl = prev_row['close'] * (1 + 0.01 * stl_param)
+            if row['close'] >= stop_loss_atr or row['high'] > stop_loss_stl:
+                signals[i] = 'Close_Sell'
+                position = 0
+                continue
+            sklow = min(sklow, row['low'])
+
+        # --- 入场 ---
+        if position == 0:
+            if prev_row['K'] <= prev_row['D'] and row['K'] > row['D']:  # 金叉
+                signals[i] = 'Buy'
+                position = 1
+                bkhigh = row['high']
+            elif prev_row['K'] >= prev_row['D'] and row['K'] < row['D']:  # 死叉
+                signals[i] = 'Sell'
+                position = -1
+                sklow = row['low']
+
+    df['signal'] = signals
+    return df
+
 # 【关键修改】修改GAN生成器加载函数
-def load_trained_gan_generators(symbol, device, window_sizes=None):
+def load_trained_gan_generators(symbol, device,gan_model_path, window_sizes=None):
     """
     加载gan_model_path目录下所有以symbol为前缀的模型文件，返回生成器列表
     """
@@ -163,7 +311,10 @@ def load_trained_gan_generators(symbol, device, window_sizes=None):
     model_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(model_module)
 
-    gan_model_path = f"../../models/trained/generators/maa"
+    if gan_model_path is None:
+        print("No generated model path!!!")
+        exit(0)
+
     if not os.path.exists(gan_model_path):
         print(f"GAN generator model directory not found at {gan_model_path}，跳过。")
         return None, None
@@ -311,10 +462,14 @@ def load_trained_gan_generators(symbol, device, window_sizes=None):
     print(f"总共加载了 {len(generators)} 个GAN生成器")
     return generators, generator_configs
 
+
+last_prediction_value = None
+
 def generate_gan_signals(
         data_file, gan_generators, device, window_sizes,
         prediction_horizon=30
 ):
+    global last_prediction_value
     """
     使用训练好的GAN生成器在1min数据上生成交易信号，加速版本
     """
@@ -324,35 +479,11 @@ def generate_gan_signals(
     target_columns = [1, 2, 3, 4]  # ohlc
     feature_columns_list = [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4]]  # 与训练时相同
 
-    # 尝试加载预先保存的归一化器
-    y_scaler_from_file = None
-    x_scalers_from_file = []  # 使用列表来存储
-    try:
-        # 假设你的归一化器文件是这样命名的：
-        # y_scaler.joblib
-        # x_scaler_0.joblib
-        # x_scaler_1.joblib
-        # x_scaler_2.joblib
-        y_scaler_from_file = joblib.load('../../models/trained/scalers/y_scaler.joblib')
-
-        # 循环加载每个 x_scaler 文件
-        for i in range(len(feature_columns_list)):
-            scaler_path = f'../../models/trained/scalers/x_scaler_{i+1}.joblib'
-            x_scalers_from_file.append(joblib.load(scaler_path))
-
-        print("成功加载所有归一化器文件。")
-    except FileNotFoundError:
-        print("未找到归一化器文件，将在函数内重新拟合。")
-        # 如果文件找不到，让 x_scalers_from_file 保持空列表状态，
-        # 这样 process_inference_data 函数会进入回退逻辑。
-
     # 处理数据
     data_config = process_inference_data(
         data_file,
         target_columns,
         feature_columns_list,
-        y_scaler=y_scaler_from_file,
-        x_scalers=x_scalers_from_file,
         log_diff=False
     )
 
@@ -426,8 +557,9 @@ def generate_gan_signals(
 
     print(f"开始批量预测，样本数: {min_len}")
 
-    # 【关键修复】确保pred_closes变量被定义
+    # 为pred_closes和pred_classes预留空间
     pred_closes = np.full((min_len, len(generators)), np.nan, dtype=np.float32)
+    pred_classes = np.full((min_len, len(generators), 3), np.nan, dtype=np.float32)
 
     # 批量处理每个generator
     for j, generator in enumerate(generators):
@@ -458,14 +590,10 @@ def generate_gan_signals(
                     end_idx = min(start_idx + batch_size, min_len)
                     batch_input = torch.FloatTensor(input_data[start_idx:end_idx]).to(device)
 
-                    out = generator(batch_input)
-
-                    if isinstance(out, tuple):
-                        train_pred = out[0]
-                    else:
-                        train_pred = out
+                    train_pred, train_cls = generator(batch_input)
 
                     train_pred = train_pred.cpu().numpy()
+                    train_cls = train_cls.cpu().numpy()
 
                     # 【添加调试】检查预测结果
                     if start_idx == 0:  # 只在第一个batch打印
@@ -485,9 +613,11 @@ def generate_gan_signals(
 
                         # 【核心修复】直接从二维数组中索引 open, high, low, close
                         # 0:open, 1:high, 2:low, 3:close
-                        pred_closes[actual_idx, j] = (pred_denorm[i, 1] +
-                                                      pred_denorm[i, 2] +
-                                                      pred_denorm[i, 3]) / 3
+                        # pred_closes[actual_idx, j] = (pred_denorm[i, 1] +
+                        #                               pred_denorm[i, 2] +
+                        #                               pred_denorm[i, 3]) / 3
+                        pred_closes[actual_idx, j] = pred_denorm[i, 3]
+                        pred_classes[actual_idx, j, :] = F.softmax(torch.from_numpy(train_cls[i, :]), dim=-1).numpy()
 
         except Exception as e:
             print(f"Generator {j} 预测失败: {e}")
@@ -498,8 +628,30 @@ def generate_gan_signals(
     # 【关键修复】改进阈值计算逻辑
     print("批量计算交易信号...")
 
-    # 集成预测
+    # 集成预测+分类头
     ensemble_pred_close = np.nanmean(pred_closes, axis=1)
+    ensemble_pred_classes = np.nanmean(pred_classes, axis=1)
+
+    # 【你的新逻辑在这里，全部修改为批量操作】
+    # 1. 创建“昨天”的预测价格数组
+    # 将今天的预测价格数组向后移位一个位置，并在第一个位置填充 NaN
+    previous_predicted_prices = np.roll(ensemble_pred_close, 1)
+    previous_predicted_prices[0] = np.nan  # 第一个样本没有昨天的预测值
+
+    # 2. 计算价格变化百分比
+    # 避免除以零错误
+    price_change_pcts = np.full_like(ensemble_pred_close, 0.0)
+
+    # 只有当昨天的预测价格不是NaN且不为0时才计算
+    valid_mask = ~np.isnan(previous_predicted_prices) & (previous_predicted_prices != 0)
+    price_change_pcts[valid_mask] = (ensemble_pred_close[valid_mask] - previous_predicted_prices[valid_mask]) / \
+                                    previous_predicted_prices[valid_mask]
+
+    # 3. 更新全局变量，为下一次函数调用做准备
+    # 只保存本次预测的最后一个值，供下一次调用使用
+    # 如果 min_len > 0，则将最后一个预测值赋值给全局变量
+    if min_len > 0:
+        last_prediction_value = ensemble_pred_close[-1]
 
     # 计算价格变化
     data_indices = np.arange(min_len) + max_window
@@ -518,8 +670,12 @@ def generate_gan_signals(
         print("警告：预测价格与当前价格差异过大，可能存在反归一化问题")
         predicted_prices = current_prices * (1 + np.random.normal(0, 0.02, len(current_prices)))
 
-    price_change_pcts = np.where(current_prices != 0,
-                                 (predicted_prices - current_prices) / current_prices, 0.0)
+    # if last_prediction_value is None:
+    #     price_change_pcts = np.where(current_prices != 0,
+    #                                  (predicted_prices - current_prices) / current_prices, 0.0)
+    # else:
+    #     price_change_pcts = (predicted_prices - last_prediction_value) / last_prediction_value
+    # last_prediction_value = predicted_prices
 
     # 【新增】偏差校正
     print("应用偏差校正...")
@@ -529,12 +685,12 @@ def generate_gan_signals(
     print(f"原始平均价格变化: {mean_change:.4f}")
 
     # 如果存在明显偏差，进行校正
-    if abs(mean_change) > 0.01:  # 如果平均变化超过1%
-        print(f"检测到预测偏差，进行校正...")
-        # 去除系统性偏差
-        corrected_price_change_pcts = price_change_pcts - mean_change
-        price_change_pcts = corrected_price_change_pcts
-        print(f"校正后平均价格变化: {np.mean(price_change_pcts):.4f}")
+    # if abs(mean_change) > 0.01:  # 如果平均变化超过1%
+    #     print(f"检测到预测偏差，进行校正...")
+    #     # 去除系统性偏差
+    #     corrected_price_change_pcts = price_change_pcts - mean_change
+    #     price_change_pcts = corrected_price_change_pcts
+    #     print(f"校正后平均价格变化: {np.mean(price_change_pcts):.4f}")
 
     # 获取日期
     dates = raw_data.iloc[data_indices]['date']
@@ -555,7 +711,7 @@ def generate_gan_signals(
 
         # 使用对称阈值确保信号平衡
         overall_threshold = np.percentile(price_change_abs, 75)  # 75分位数
-        buy_threshold = max(0.005, min(0.03, overall_threshold))
+        buy_threshold = max(0.00, min(0.03, overall_threshold))
         sell_threshold = buy_threshold  # 使用相同阈值确保对称性
 
         print(f"对称阈值: {buy_threshold:.4f} ({buy_threshold * 100:.2f}%)")
@@ -568,9 +724,18 @@ def generate_gan_signals(
 
     # 生成对称信号
     signals_arr = np.full(min_len, 'Hold', dtype=object)
+    # 获取分类结果中每个样本概率最高的类别索引
+    #  - 2: 当前值 > 前一时刻（上升）
+    #  - 0: 当前值 < 前一时刻（下降）
+    #  - 1: 当前值 == 前一时刻（平稳）
+    pred_classes_idx = np.argmax(ensemble_pred_classes, axis=1)
+
+    # 只有当模型分类为“上涨”并且价格变化超过阈值时才发出“买入”信号
     buy_mask = price_change_pcts > buy_threshold
+    # 只有当模型分类为“下跌”并且价格变化超过阈值时才发出“卖出”信号
     sell_mask = price_change_pcts < -sell_threshold
 
+    # 生成最终的买卖信号
     signals_arr[buy_mask] = 'Buy'
     signals_arr[sell_mask] = 'Sell'
 
@@ -590,15 +755,21 @@ def generate_gan_signals(
         try:
             date_value = dates.iloc[i]  # 直接从 Series 中获取 Timestamp，它会保留时区
 
-            signals.append({
+            signal_data={
                 'date': date_value,
                 'signal': signals_arr[i],
                 'predicted_price': predicted_prices[i],
                 'current_price': current_prices[i],
                 'price_change_pct': price_change_pcts[i],
                 'buy_threshold': buy_threshold,
-                'sell_threshold': sell_threshold
-            })
+                'sell_threshold': sell_threshold,
+                'pred_class_down': ensemble_pred_classes[i, 0],
+                'pred_class_hold': ensemble_pred_classes[i, 1],
+                'pred_class_up': ensemble_pred_classes[i, 2]
+            }
+
+            # 将完整的字典追加到列表中
+            signals.append(signal_data)
         except Exception as e:
             print(f"构造信号 {i} 时出错: {e}")
             continue
